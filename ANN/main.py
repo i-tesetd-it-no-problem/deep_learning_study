@@ -3,473 +3,709 @@ ANN案例的实现步骤
     1. 构建数据集
     2. 搭建神经网络
     3. 模型训练
-    4. 模型测试
+    4. 模型验证
+    5. 模型测试
+    6. 训练曲线与混淆矩阵可视化
 
+当前版本是一个比较完整的表格数据多分类ANN/MLP训练模板
+适用于:
+    1. CSV表格数据
+    2. 多分类任务
+    3. PyTorch入门到进阶的标准训练流程
+
+当前代码包含的优化点:
+    1. train / val / test 三划分
+    2. 标准化(StandardScaler)
+    3. AdamW优化器
+    4. weight_decay正则化
+    5. 学习率调度器 ReduceLROnPlateau
+    6. Early Stopping
+    7. BatchNorm
+    8. Dropout
+    9. GPU训练
+    10. AMP混合精度训练
+    11. 梯度裁剪
+    12. 保存最佳模型
+    13. 四张训练/验证曲线图
+    14. 测试集最终评估
+    15. 混淆矩阵和分类报告
 """
+
+import os
+import copy
+import random
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
 import torch
 from torch.utils.data import TensorDataset
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.optim as optim
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
+from sklearn.metrics import confusion_matrix, classification_report
+
 from torchinfo import summary
-import time
+
+# =========================
+# 0. 全局配置
+# =========================
+SEED = 42
+CSV_PATH = "./手机价格预测.csv"
+BEST_MODEL_PATH = "best_phone_price_model.pth"
+
+CONFIG = {
+    # 数据划分
+    "test_size": 0.2,  # 测试集占比
+    "val_size": 0.2,  # 从训练验证集合中再切出验证集占比
+    # DataLoader
+    "batch_size": 32,  # 批次
+    "num_workers": 0,  # Windows下建议先用0，最稳
+    # 训练超参数
+    "epochs": 200,  # 训练轮数
+    "lr": 1e-3,  # 学习率
+    "weight_decay": 1e-4,  # 权重衰减
+    "gradient_clip": 1.0,  # 梯度裁剪阈值，None表示不裁剪
+    # 学习率调度器
+    "scheduler_factor": 0.5,  # 当验证集loss不下降时，学习率降低的倍数，例如0.5表示降低到原来的一半
+    "scheduler_patience": 8,  # 学习率调度器的耐心值，即验证集loss多少轮不下降时触发学习率降低
+    "scheduler_min_lr": 1e-6,  # 学习率调度器的最小学习率，防止学习率降低过多
+    # Early Stopping
+    "early_stopping_patience": 20,  # 早停的耐心值，即验证集loss多少轮不改善时触发早停
+    "early_stopping_min_delta": 1e-4,  # 早停的最小改善值，只有当验证集loss改善超过这个值时才算真正提升，防止过早触发早停
+    # 模型结构
+    "hidden_dims": [
+        128,
+        256,
+        128,
+    ],  # 隐藏层结构，可以根据需要调整，例如 [64, 128] 或 [256, 256, 256]
+    "dropout": 0.3,  # Dropout概率，0.3表示每个神经元有30%的概率被丢弃
+    "use_bn": True,  # 是否使用BatchNorm，通常在MLP中使用BatchNorm可以加速训练和提升性能
+    # 是否开启AMP混合精度训练，只有在GPU可用时才会启用
+    "use_amp": True,
+}
 
 
-# 1. 构建数据集
-def create_dataset():
-    # 1.1  加载CSV
-    data = pd.read_csv("./手机价格预测.csv")  # (2000, 21) 20个特征 一个分类
+# =========================
+# 1. 固定随机种子
+# =========================
+def set_seed(seed: int = 42):
+    # 固定Python随机种子
+    random.seed(seed)
 
-    # 1.2 获取X特征列 和Y标签列
-    x, y = data.iloc[:, :-1], data.iloc[:, -1]  # x:(2000, 20) y:(2000,)
+    # 固定numpy随机种子
+    np.random.seed(seed)
 
-    # 1.3 把特征列转为浮点值
+    # 固定torch随机种子
+    torch.manual_seed(seed)
+
+    # 固定cuda随机种子
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # 为了尽量复现结果
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# =========================
+# 2. 构建数据集
+# =========================
+def create_datasets():
+    # 2.1 加载CSV
+    data = pd.read_csv(CSV_PATH)  # 形状通常为 (2000, 21)，20个特征 + 1个标签
+
+    # 2.2 获取X特征列 和Y标签列
+    x, y = data.iloc[:, :-1], data.iloc[:, -1]  # x:(N, 20) y:(N,)
+
+    # 2.3 把特征列转为浮点值
+    # 表格数据喂给神经网络时，特征一般用float32
     x = x.astype(np.float32)
 
-    # 1.4 切分训练集和测试集
-    # stratify=y: 按照y的分布切分训练集和测试集，保证训练集和测试集中y的分布相似
-    # random_state=3: 固定随机种子，保证每次切分结果一致，便于复现
-    x_train, x_test, y_train, y_test = train_test_split(
-        x, y, test_size=0.2, random_state=3, stratify=y
+    # 2.4 第一次切分: 先切出测试集
+    # stratify=y: 按类别分层抽样，保证各数据集类别分布相似
+    # random_state=SEED: 固定随机种子，保证可复现
+    x_train_val, x_test, y_train_val, y_test = train_test_split(
+        x, y, test_size=CONFIG["test_size"], random_state=SEED, stratify=y
     )
 
-    # 1.5 对数据进行标准化
-    # 标准化是表格数据ANN中非常重要的一步
-    # 作用:
-    #   1. 消除不同特征之间量纲差异
-    #   2. 避免某些数值特别大的特征主导训练
-    #   3. 通常能让训练更稳定、收敛更快
+    # 2.5 第二次切分: 从训练验证集合中切出验证集
+    x_train, x_val, y_train, y_val = train_test_split(
+        x_train_val,
+        y_train_val,
+        test_size=CONFIG["val_size"],
+        random_state=SEED,
+        stratify=y_train_val,
+    )
+
+    # 2.6 对数据进行标准化
     # 注意:
     #   1. 只能在训练集上fit
-    #   2. 测试集只能用训练集得到的均值和方差做transform
-    # 如果出现这些问题，可以优先检查这里:
-    #   1. loss下降很慢
-    #   2. 训练不稳定，波动很大
-    #   3. 准确率长期上不去
-    # 可选方案:
-    #   1. StandardScaler 标准化(当前使用，最常见)
-    #   2. MinMaxScaler 归一化到[0, 1]
-    #   3. RobustScaler 对异常值更稳
+    #   2. 验证集和测试集只能使用训练集得到的均值和标准差进行transform
+    # 这样可以避免数据泄漏
     scaler = StandardScaler()
     x_train = scaler.fit_transform(x_train)
+    x_val = scaler.transform(x_val)
     x_test = scaler.transform(x_test)
 
-    # 1.6 把数据集封装成张量数据集 参数：特征张量，标签张量
-    # 特征一般用float32
+    # 2.7 把数据封装成张量数据集
     # 多分类标签一般用long，因为CrossEntropyLoss要求类别标签是整数索引
     train_dataset = TensorDataset(
         torch.tensor(x_train, dtype=torch.float32),
         torch.tensor(y_train.values, dtype=torch.long),
     )
 
-    # 1.7 把测试集封装成张量数据集 参数：特征张量，标签张量
+    val_dataset = TensorDataset(
+        torch.tensor(x_val, dtype=torch.float32),
+        torch.tensor(y_val.values, dtype=torch.long),
+    )
+
     test_dataset = TensorDataset(
         torch.tensor(x_test, dtype=torch.float32),
         torch.tensor(y_test.values, dtype=torch.long),
     )
 
-    # 1.8 返回结果 参数：训练集，测试集，输入特征数(20)，类别数(4)
-    return train_dataset, test_dataset, x_train.shape[1], len(np.unique(y))
+    # 2.8 返回结果
+    input_dim = x_train.shape[1]
+    output_dim = len(np.unique(y))
+
+    meta_info = {
+        "input_dim": input_dim,  # 输入特征数，例如20
+        "output_dim": output_dim,  # 输出类别数，例如4
+        "scaler_mean": scaler.mean_,  # scaler.scale_: 标准化的均值和标准差，可以在推理阶段使用同样的标准化参数对新数据进行处理，保证训练和推理的一致性
+        "scaler_scale": scaler.scale_,  # 如果需要在推理阶段对新数据进行标准化处理，必须使用训练集上fit得到的均值和标准差，而不能重新计算，否则会导致数据泄漏和性能下降
+        "train_size": len(train_dataset),  # 训练集样本数，例如1280
+        "val_size": len(val_dataset),  # 验证集样本数，例如320
+        "test_size": len(test_dataset),  # 测试集样本数，例如400
+    }
+
+    return train_dataset, val_dataset, test_dataset, meta_info
 
 
-# 2. 搭建神经网络
+# =========================
+# 3. 创建DataLoader
+# =========================
+def create_dataloaders(train_dataset, val_dataset, test_dataset, device):
+    # pin_memory在GPU训练时通常有助于加速数据搬运
+    pin_memory = device.type == "cuda"
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=CONFIG["batch_size"],
+        shuffle=True,
+        num_workers=CONFIG["num_workers"],
+        pin_memory=pin_memory,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CONFIG["batch_size"],
+        shuffle=False,
+        num_workers=CONFIG["num_workers"],
+        pin_memory=pin_memory,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=CONFIG["batch_size"],
+        shuffle=False,
+        num_workers=CONFIG["num_workers"],
+        pin_memory=pin_memory,
+    )
+
+    return train_loader, val_loader, test_loader
+
+
+# =========================
+# 4. 搭建神经网络
+# =========================
 class PhonePriceModel(nn.Module):
     """
     param input_dim: 输入特征数
     param output_dim: 类别数
+    param hidden_dims: 隐藏层结构，例如 [128, 256, 128]
+    param dropout: Dropout概率
+    param use_bn: 是否使用BatchNorm
     """
 
-    def __init__(self, input_dim, output_dim):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims=None,
+        dropout: float = 0.3,
+        use_bn: bool = True,
+    ):
         super().__init__()
 
-        self.input_dim = input_dim  # 输入特征数
-        self.output_dim = output_dim  # 类别数
+        if hidden_dims is None:
+            hidden_dims = [128, 256, 128]
 
-        # 隐藏层1 [20, 128] 隐藏层2 [128, 256] 输出层 [256, 4]
-        # 当前是一个比较基础的MLP结构
-        # 如果出现这些问题，可以优化这里:
-        #   1. 模型太简单，训练准确率和测试准确率都不高 -> 可以增加网络深度/宽度
-        #   2. 模型过拟合，训练准确率高但测试准确率低 -> 可以减小网络规模、加Dropout、加正则化
-        # 可选优化方案:
-        #   1. 更浅的网络: 20 -> 64 -> 4
-        #   2. 更深的网络: 20 -> 128 -> 256 -> 128 -> 4
-        #   3. 更宽的网络: 20 -> 256 -> 256 -> 4
-        # 注意:
-        #   1. 表格数据不一定越深越好
-        #   2. 小数据集下网络过深更容易过拟合
-        self.linear1 = nn.Linear(self.input_dim, 128)
-        self.linear2 = nn.Linear(128, 256)
-        self.output = nn.Linear(256, self.output_dim)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dims = hidden_dims
+        self.dropout_p = dropout
+        self.use_bn = use_bn
 
-        # Dropout层
-        # 作用:
-        #   1. 训练时随机丢弃一部分神经元，减少过拟合
-        # 如果出现这些问题，可以考虑开启Dropout:
-        #   1. 训练准确率很高，测试准确率明显偏低
-        #   2. 训练loss持续下降，但测试效果不提升
-        # 常见设置:
-        #   1. 0.2
-        #   2. 0.3
-        #   3. 0.5
-        # 当前先保留但默认启用一个中等强度的Dropout
-        self.dropout = nn.Dropout(p=0.3)
+        layers = []
+        prev_dim = input_dim
 
-        # BN(Batch Normalization)层
-        # BN和输入标准化不是一回事:
-        #   1. 输入标准化是对原始输入特征做处理
-        #   2. BN是对网络中间层输出做处理
-        # 如果出现这些问题，可以考虑BN:
-        #   1. 训练不稳定
-        #   2. loss震荡明显
-        #   3. 学习率稍大时训练容易发散
-        # 注意:
-        #   1. 表格ANN不一定必须加BN
-        #   2. 先做输入标准化通常更重要
-        self.bn1 = nn.BatchNorm1d(128)
-        self.bn2 = nn.BatchNorm1d(256)
+        # 4.1 动态构建MLP结构
+        # 常见顺序:
+        #   Linear -> BatchNorm -> ReLU -> Dropout
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
 
-    # 前向传播函数
+            if use_bn:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+
+            prev_dim = hidden_dim
+
+        # 4.2 特征提取部分
+        self.feature_extractor = nn.Sequential(*layers)
+
+        # 4.3 输出层
+        # 多分类任务 + CrossEntropyLoss
+        # 输出层不需要手动加softmax
+        self.output_layer = nn.Linear(prev_dim, output_dim)
+
+        # 4.4 初始化参数
+        self._init_weights()
+
+    def _init_weights(self):
+        # 对线性层做Kaiming初始化，更适合ReLU类激活函数
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def forward(self, x):
-        # 2.1 隐藏层1 加权求和
-        x = self.linear1(x)
-
-        # 2.2 BN归一化
-        # 如果你想做消融实验，可以临时注释掉BN看看效果变化
-        x = self.bn1(x)
-
-        # 2.3 激活函数
-        # 当前使用ReLU，最常见
-        # 如果出现“神经元死亡”或者训练效果一般，可以试:
-        #   1. LeakyReLU
-        #   2. GELU
-        x = torch.relu(x)
-
-        # 2.4 Dropout
-        x = self.dropout(x)
-
-        # 2.5 隐藏层2 加权求和
-        x = self.linear2(x)
-
-        # 2.6 BN归一化
-        x = self.bn2(x)
-
-        # 2.7 激活函数
-        x = torch.relu(x)
-
-        # 2.8 Dropout
-        x = self.dropout(x)
-
-        # 2.9 输出层 加权求和
-        # 后续用多分类交叉熵损失函数，所以输出层不需要激活函数
-        # CrossEntropyLoss函数内部会自动调用softmax相关计算
-        return self.output(x)
+        x = self.feature_extractor(x)
+        x = self.output_layer(x)
+        return x
 
 
-# 3. 模型训练
-def train_model(train_dataset, model, device):
-    # 1. 创建数据加载器 参数：训练集，批次大小，是否打乱数据
-    # batch_size是一个重要超参数
-    # 如果出现这些问题，可以优化这里:
-    #   1. 显存不够 -> 减小batch_size
-    #   2. 训练不够稳定 -> 可以尝试稍大一点batch_size
-    #   3. 收敛速度慢 -> 可以结合硬件尝试更大的batch_size
-    # 常见可选值:
-    #   8 / 16 / 32 / 64
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+# =========================
+# 5. 早停机制
+# =========================
+class EarlyStopping:
+    """
+    早停机制:
+        1. 如果验证集loss连续若干轮没有改善，则停止训练
+        2. 防止过拟合
+        3. 节省训练时间
+    """
 
-    # 2. 定义损失函数，多分类交叉熵损失函数适用于多分类问题
-    # 如果类别极度不平衡，可以考虑给CrossEntropyLoss加权重 weight=
-    criterion = nn.CrossEntropyLoss()
+    def __init__(self, patience=20, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float("inf")
+        self.counter = 0
+        self.should_stop = False
 
-    # 3. 定义优化器 参数：模型参数，学习率
-    # 当前用Adam，适合大多数入门场景，收敛快，比较稳
-    # 如果出现这些问题，可以优化这里:
-    #   1. 收敛慢 -> Adam通常比SGD更快
-    #   2. 泛化一般 -> 可以试SGD + momentum
-    #   3. 过拟合 -> 可以试AdamW并加weight_decay
-    # 可选方案:
-    #   1. Adam
-    #   2. SGD(momentum=0.9)
-    #   3. AdamW(weight_decay=1e-4)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    def step(self, current_loss):
+        # 当前loss比历史最好loss改善了至少min_delta，才算真正提升
+        if current_loss < self.best_loss - self.min_delta:
+            self.best_loss = current_loss
+            self.counter = 0
+        else:
+            self.counter += 1
 
-    # 4. 学习率调度器
-    # 作用:
-    #   1. 前期学习快一点
-    #   2. 后期学习慢一点，训练更稳定
-    # 如果出现这些问题，可以优化这里:
-    #   1. 前期下降正常，后期不再提升 -> 可以降低学习率
-    #   2. loss在某个阶段震荡不收敛 -> 可以尝试学习率衰减
-    # 当前使用StepLR作为示例:
-    #   每30轮，学习率乘0.5
-    # 可选方案:
-    #   1. StepLR
-    #   2. ReduceLROnPlateau
-    #   3. CosineAnnealingLR
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
-
-    # 5. 定义列表记录每轮训练的平均损失和准确率
-    # 为什么训练里也统计准确率:
-    #   1. 训练准确率用于观察模型是否学会
-    #   2. 测试准确率用于观察泛化能力
-    # 训练acc和测试acc都应该看
-    train_loss_list = []
-    train_acc_list = []
-
-    # 6. 模型训练
-    # epochs也是一个重要超参数
-    # 如果出现这些问题，可以优化这里:
-    #   1. 训练还没收敛 -> 增加epochs
-    #   2. 训练很早就不再提升 -> 可以减少epochs
-    #   3. 训练集效果越来越好，测试集反而变差 -> 可能过拟合
-    epochs = 100  # 训练轮数
-
-    for i in range(epochs):
-        # 6.1 切换模型状态为训练模式
-        model.train()
-
-        # 6.2 变量定义
-        total_loss = 0.0  # 累积损失
-        cur_batch_size = 0  # 当前轮累计样本数
-        correct = 0  # 当前轮预测正确的样本数
-        start_time = time.time()  # 记录开始时间
-
-        for x, y in train_loader:
-            # 6.3 把每个批次的数据移动到指定设备(GPU或CPU)
-            x = x.to(device)
-            y = y.to(device)
-
-            # 6.4 梯度清零
-            optimizer.zero_grad()
-
-            # 6.5 模型预测
-            y_pred = model(x)
-
-            # 6.6 计算损失 参数：预测结果，真实标签
-            loss = criterion(y_pred, y)
-
-            # 6.7 反向传播
-            loss.backward()
-
-            # 6.8 更新参数
-            optimizer.step()
-
-            # 6.9 累积损失
-            total_loss += loss.item() * x.size(0)
-
-            # 6.10 累积样本数
-            cur_batch_size += x.size(0)
-
-            # 6.11 统计当前批次预测正确的样本数
-            pred_label = torch.argmax(y_pred, dim=1)
-            correct += (pred_label == y).sum().item()
-
-        # 6.12 更新学习率
-        scheduler.step()
-
-        # 6.13 计算当前轮平均损失和准确率
-        avg_loss = total_loss / cur_batch_size
-        avg_acc = correct / cur_batch_size
-
-        # 6.14 保存当前轮平均损失和准确率
-        train_loss_list.append(avg_loss)
-        train_acc_list.append(avg_acc)
-
-        end_time = time.time()  # 记录结束时间
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        print(
-            f"Epoch {i + 1}/{epochs} 平均损失: {avg_loss:.4f} 训练准确率: {avg_acc:.4f} 学习率: {current_lr:.6f} 耗时: {end_time - start_time:.2f}秒"
-        )
-
-        # 6.15 这里是Early Stopping思路说明(当前未正式启用)
-        # 如果出现这些问题，可以考虑早停:
-        #   1. 训练轮数很多，但后期基本不再提升
-        #   2. 测试集效果开始下降
-        # 常见做法:
-        #   1. 连续patience轮没有提升就停止训练
-        #   2. 保存最佳模型参数
-        # 当前代码没有引入验证集，所以这里只写思路，不直接启用
-        # 如果后面要做更规范训练，建议:
-        #   训练集 / 验证集 / 测试集 三划分
-
-    # 6.16 模型训练完成，保存模型参数
-    # 包含(权重矩阵和偏置矩阵)
-    torch.save(model.state_dict(), "phone_price_model.pth")
-    print("模型参数已保存到 phone_price_model.pth")
-
-    # 6.17 返回训练过程中的损失和准确率
-    return train_loss_list, train_acc_list
+        if self.counter >= self.patience:
+            self.should_stop = True
 
 
-# 4. 模型测试
-def test_evaluate(test_dataset, model, device):
-    # 1. 创建测试集数据加载器 参数：测试集，批次大小，是否打乱数据
-    # 测试时一般不打乱
-    # batch_size可以和训练一致，也可以更大，只要显存允许
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+# =========================
+# 6. 计算准确率
+# =========================
+def calculate_accuracy(logits, labels):
+    preds = torch.argmax(logits, dim=1)
+    correct = (preds == labels).sum().item()
+    total = labels.size(0)
+    return correct, total
 
-    # 2. 切换模型状态为评估模式
+
+# =========================
+# 7. 单轮训练
+# =========================
+def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_amp):
+    # 切换到训练模式
+    model.train()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    for x, y in train_loader:
+        # 7.1 数据移动到指定设备
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        # 7.2 梯度清零
+        optimizer.zero_grad()
+
+        # 7.3 AMP混合精度训练
+        # 只有在cuda可用且use_amp=True时启用
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model(x)
+            loss = criterion(logits, y)
+
+        # 7.4 反向传播
+        scaler.scale(loss).backward()
+
+        # 7.5 梯度裁剪
+        # 如果训练不稳定、梯度爆炸，可以考虑这里
+        if CONFIG["gradient_clip"] is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["gradient_clip"])
+
+        # 7.6 更新参数
+        scaler.step(optimizer)
+        scaler.update()
+
+        # 7.7 统计loss和accuracy
+        total_loss += loss.item() * x.size(0)
+        correct, batch_size = calculate_accuracy(logits, y)
+        total_correct += correct
+        total_samples += batch_size
+
+    avg_loss = total_loss / total_samples
+    avg_acc = total_correct / total_samples
+    return avg_loss, avg_acc
+
+
+# =========================
+# 8. 单轮验证/测试
+# =========================
+def evaluate_one_epoch(model, data_loader, criterion, device):
+    # 切换到评估模式
     model.eval()
 
-    # 3. 定义变量
-    correct = 0  # 记录预测正确的样本数
-    total_loss = 0.0  # 累积损失
-    total_samples = 0  # 总样本数
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
 
-    # 4. 定义损失函数，多分类交叉熵损失函数适用于多分类问题
+    all_preds = []
+    all_labels = []
+
+    # 验证和测试阶段不需要梯度
+    with torch.no_grad():
+        for x, y in data_loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            logits = model(x)
+            loss = criterion(logits, y)
+
+            total_loss += loss.item() * x.size(0)
+            correct, batch_size = calculate_accuracy(logits, y)
+            total_correct += correct
+            total_samples += batch_size
+
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.cpu().numpy().tolist())
+            all_labels.extend(y.cpu().numpy().tolist())
+
+    avg_loss = total_loss / total_samples
+    avg_acc = total_correct / total_samples
+    return avg_loss, avg_acc, all_preds, all_labels
+
+
+# =========================
+# 9. 完整训练流程
+# =========================
+def train_model(train_loader, val_loader, model, device):
+    # 9.1 定义损失函数
     criterion = nn.CrossEntropyLoss()
 
-    # 5. 关闭梯度计算，减少内存占用，加快测试速度
-    with torch.no_grad():
-        # 6. 从数据加载器中获取到每批次的数据
-        for x, y in test_loader:
-            # 6.1 把数据移动到指定设备
-            x = x.to(device)
-            y = y.to(device)
+    # 9.2 定义优化器
+    # AdamW通常比Adam更适合带weight_decay的场景
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=CONFIG["lr"],
+        weight_decay=CONFIG["weight_decay"],
+    )
 
-            # 6.2 模型预测
-            y_pred = model(x)
+    # 9.3 定义学习率调度器
+    # ReduceLROnPlateau: 当验证集loss长期不下降时，自动降低学习率
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=CONFIG["scheduler_factor"],
+        patience=CONFIG["scheduler_patience"],
+        min_lr=CONFIG["scheduler_min_lr"],
+    )
 
-            # 6.3 计算损失
-            loss = criterion(y_pred, y)
+    # 9.4 Early Stopping
+    early_stopping = EarlyStopping(
+        patience=CONFIG["early_stopping_patience"],
+        min_delta=CONFIG["early_stopping_min_delta"],
+    )
 
-            # 6.4 累积损失
-            total_loss += loss.item() * x.size(0)
+    # 9.5 AMP缩放器
+    use_amp = CONFIG["use_amp"] and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-            # 6.5 根据加权求和得到类别 用argmax函数获取每行最大值的索引作为预测类别(替代了softmax函数，一样的效果)
-            y_pred = torch.argmax(y_pred, dim=1)  # dim=1表示按行取最大值的索引
+    # 9.6 记录训练历史
+    history = {
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+        "lr": [],
+    }
 
-            # 6.6 统计预测正确的样本数
-            correct += (y_pred == y).sum().item()
+    best_model_state = None
+    best_val_loss = float("inf")
+    best_epoch = 0
 
-            # 6.7 累积总样本数
-            total_samples += x.size(0)
+    # 9.7 开始训练
+    for epoch in range(CONFIG["epochs"]):
+        start_time = time.time()
 
-    # 7. 模型测试完成，计算平均损失和准确率
-    avg_loss = total_loss / total_samples
-    accuracy = correct / total_samples
-    print(f"模型测试完成，平均损失: {avg_loss:.4f} 准确率: {accuracy:.4f}")
+        # 训练一轮
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler, device, use_amp
+        )
 
-    # 8. 对测试结果的解释
-    # 如果出现这些情况，可以这样判断:
-    #   1. 训练准确率高，测试准确率低 -> 可能过拟合
-    #      可优化:
-    #         - 加Dropout
-    #         - 减小模型规模
-    #         - 加weight_decay
-    #         - 做早停
-    #   2. 训练准确率低，测试准确率也低 -> 模型可能欠拟合
-    #      可优化:
-    #         - 增加网络深度/宽度
-    #         - 增加训练轮数
-    #         - 调大学习率或换优化器
-    #   3. loss震荡、训练不稳 -> 可优化:
-    #         - 降低学习率
-    #         - 使用标准化
-    #         - 使用BN
-    #   4. 测试准确率长期上不去 -> 可优化:
-    #         - 检查数据质量
-    #         - 做特征工程
-    #         - 调整模型结构
-    #         - 调整优化器/学习率
+        # 验证一轮
+        val_loss, val_acc, _, _ = evaluate_one_epoch(
+            model, val_loader, criterion, device
+        )
 
-    # 9. 返回测试损失和准确率
-    return avg_loss, accuracy
+        # 更新学习率调度器
+        scheduler.step(val_loss)
+
+        # 记录当前学习率
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # 保存历史
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        history["lr"].append(current_lr)
+
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            best_model_state = copy.deepcopy(model.state_dict())
+
+            torch.save(
+                {
+                    "model_state_dict": best_model_state,
+                    "best_val_loss": best_val_loss,
+                    "best_epoch": best_epoch,
+                    "input_dim": model.input_dim,
+                    "output_dim": model.output_dim,
+                    "hidden_dims": model.hidden_dims,
+                    "dropout": model.dropout_p,
+                    "use_bn": model.use_bn,
+                    "config": CONFIG,
+                },
+                BEST_MODEL_PATH,
+            )
+
+        # Early Stopping检查
+        early_stopping.step(val_loss)
+
+        end_time = time.time()
+
+        print(
+            f"Epoch {epoch + 1}/{CONFIG['epochs']} | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Train Acc: {train_acc:.4f} | "
+            f"Val Loss: {val_loss:.4f} | "
+            f"Val Acc: {val_acc:.4f} | "
+            f"LR: {current_lr:.6f} | "
+            f"Time: {end_time - start_time:.2f}s"
+        )
+
+        if early_stopping.should_stop:
+            print(f"Early Stopping触发，提前结束训练，停止于第 {epoch + 1} 轮")
+            break
+
+    # 9.8 加载最佳模型参数
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    print(f"最佳验证集Loss: {best_val_loss:.4f}，对应Epoch: {best_epoch}")
+    print(f"最佳模型已保存到 {BEST_MODEL_PATH}")
+
+    return model, history
 
 
-# 5. 绘制训练曲线
-def plot_history(train_loss_list, train_acc_list):
-    # 1. 创建轮数列表
-    epochs = range(1, len(train_loss_list) + 1)
+# =========================
+# 10. 测试集评估
+# =========================
+def test_evaluate(test_loader, model, device):
+    criterion = nn.CrossEntropyLoss()
 
-    # 2. 创建画布
-    plt.figure(figsize=(12, 5))
+    test_loss, test_acc, preds, labels = evaluate_one_epoch(
+        model, test_loader, criterion, device
+    )
 
-    # 3. 绘制损失曲线
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs, train_loss_list, label="Train Loss")
+    print(f"模型测试完成，平均损失: {test_loss:.4f} 准确率: {test_acc:.4f}")
+
+    return test_loss, test_acc, preds, labels
+
+
+# =========================
+# 11. 绘制四张训练/验证曲线图
+# =========================
+def plot_history(history):
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    plt.figure(figsize=(14, 10))
+
+    # 11.1 训练损失
+    plt.subplot(2, 2, 1)
+    plt.plot(epochs, history["train_loss"], label="Train Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title("Training Loss")
+    plt.title("Train Loss")
     plt.legend()
 
-    # 4. 绘制准确率曲线
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs, train_acc_list, label="Train Accuracy")
+    # 11.2 验证损失
+    plt.subplot(2, 2, 2)
+    plt.plot(epochs, history["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Validation Loss")
+    plt.legend()
+
+    # 11.3 训练准确率
+    plt.subplot(2, 2, 3)
+    plt.plot(epochs, history["train_acc"], label="Train Accuracy")
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
-    plt.title("Training Accuracy")
+    plt.title("Train Accuracy")
     plt.legend()
 
-    # 5. 调整布局并显示图像
+    # 11.4 验证准确率
+    plt.subplot(2, 2, 4)
+    plt.plot(epochs, history["val_acc"], label="Val Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title("Validation Accuracy")
+    plt.legend()
+
     plt.tight_layout()
     plt.show()
 
-    # 6. 如何看曲线
-    # 如果出现这些情况，可以这样判断:
-    #   1. loss持续下降，acc持续上升 -> 训练正常
-    #   2. loss几乎不降 -> 学习率可能太小 / 模型太弱 / 数据问题
-    #   3. loss大幅震荡 -> 学习率可能太大 / 训练不稳定
-    #   4. 训练acc很高，但测试acc一般 -> 可能过拟合
-    #   5. 很早就进入平台期 -> 可以尝试学习率衰减 / 调整模型 / 延长训练或早停
+
+# =========================
+# 12. 绘制学习率曲线
+# =========================
+def plot_lr(history):
+    epochs = range(1, len(history["lr"]) + 1)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history["lr"], label="Learning Rate")
+    plt.xlabel("Epoch")
+    plt.ylabel("LR")
+    plt.title("Learning Rate Schedule")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 
-if __name__ == "__main__":
-    # 1. 构建 训练集和测试集 输入特征数 类别数
-    train_dataset, test_dataset, input_dim, output_dim = create_dataset()
-    print(f"输入特征数: {input_dim} 类别数: {output_dim}")
+# =========================
+# 13. 绘制混淆矩阵
+# =========================
+def plot_confusion_matrix(y_true, y_pred, num_classes):
+    cm = confusion_matrix(y_true, y_pred)
 
-    # 2. 选择设备
-    # 如果GPU可用，则优先使用GPU
-    # 如果训练时报device不一致错误，通常要检查:
-    #   1. 模型是否.to(device)
-    #   2. 输入x是否.to(device)
-    #   3. 标签y是否.to(device)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    plt.figure(figsize=(7, 6))
+    plt.imshow(cm, cmap="Blues")
+    plt.title("Confusion Matrix")
+    plt.colorbar()
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+
+    plt.xticks(range(num_classes))
+    plt.yticks(range(num_classes))
+
+    for i in range(num_classes):
+        for j in range(num_classes):
+            plt.text(j, i, cm[i, j], ha="center", va="center")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    # 14.1 固定随机种子
+    set_seed(SEED)
+
+    # 14.2 选择设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"当前设备: {device}")
 
-    # 3. 搭建神经网络
-    model = PhonePriceModel(input_dim, output_dim).to(device)
+    # 14.3 构建数据集
+    train_dataset, val_dataset, test_dataset, meta_info = create_datasets()
 
-    # 4. 打印模型结构和参数量
-    summary(model, input_size=(16, input_dim), device=device)
+    print(
+        f"输入特征数: {meta_info['input_dim']} | "
+        f"类别数: {meta_info['output_dim']} | "
+        f"训练集: {meta_info['train_size']} | "
+        f"验证集: {meta_info['val_size']} | "
+        f"测试集: {meta_info['test_size']}"
+    )
 
-    # 5. 模型训练
-    train_loss_list, train_acc_list = train_model(train_dataset, model, device)
+    # 14.4 构建DataLoader
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_dataset, val_dataset, test_dataset, device
+    )
 
-    # 6. 模型测试
-    test_evaluate(test_dataset, model, device)
+    # 14.5 搭建神经网络
+    model = PhonePriceModel(
+        input_dim=meta_info["input_dim"],
+        output_dim=meta_info["output_dim"],
+        hidden_dims=CONFIG["hidden_dims"],
+        dropout=CONFIG["dropout"],
+        use_bn=CONFIG["use_bn"],
+    ).to(device)
 
-    # 7. 绘制训练曲线
-    plot_history(train_loss_list, train_acc_list)
+    # 14.6 打印模型结构和参数量
+    summary(
+        model,
+        input_size=(CONFIG["batch_size"], meta_info["input_dim"]),
+        device=device.type,
+    )
 
-    # 8. 进一步可选优化总结
-    # 当前代码已经包含/体现的优化点:
-    #   1. 数据标准化
-    #   2. Adam优化器
-    #   3. 学习率调度器
-    #   4. BatchNorm
-    #   5. Dropout
-    #   6. 训练准确率监控
-    #   7. 测试损失和测试准确率监控
-    #
-    # 还可以进一步尝试的优化:
-    #   1. 把Adam改成AdamW，并加weight_decay
-    #      适用于: 训练集很好，测试集一般，怀疑过拟合
-    #   2. 使用SGD + momentum
-    #      适用于: 想比较不同优化器的泛化效果
-    #   3. 调整batch_size
-    #      适用于: 显存足够 / 训练稳定性一般 / 收敛速度一般
-    #   4. 调整隐藏层结构
-    #      适用于: 模型欠拟合或过拟合
-    #   5. 使用验证集 + Early Stopping
-    #      适用于: 想更规范地防止过拟合
-    #   6. 做更好的特征工程
-    #      适用于: 表格任务准确率长期卡住
+    # 14.7 模型训练
+    model, history = train_model(train_loader, val_loader, model, device)
+
+    # 14.8 模型测试
+    test_loss, test_acc, preds, labels = test_evaluate(test_loader, model, device)
+
+    # 14.9 绘制四张训练/验证曲线图
+    plot_history(history)
+
+    # 14.10 绘制学习率曲线
+    plot_lr(history)
+
+    # 14.11 绘制混淆矩阵
+    plot_confusion_matrix(labels, preds, meta_info["output_dim"])
+
+    # 14.12 输出分类报告
+    print("分类报告:")
+    print(classification_report(labels, preds, digits=4))
+
+
+# =========================
+# 14. 主函数
+# =========================
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,42 @@
+project:
+  name: phone_price_mlp
+  output_root: ./outputs
+  exp_name: baseline
+  seed: 42
+
+data:
+  csv_path: ./手机价格预测.csv
+  target_col: null
+  test_size: 0.2
+  val_size: 0.2
+  batch_size: 32
+  num_workers: 0
+  label_encoding: auto
+  dropna: true
+  fill_missing_numeric: false
+  numeric_fill_value: 0.0
+
+model:
+  hidden_dims: [128, 256, 128]
+  dropout: 0.3
+  use_bn: true
+
+train:
+  epochs: 200
+  lr: 0.001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  use_amp: true
+
+scheduler:
+  factor: 0.5
+  patience: 8
+  min_lr: 0.000001
+
+early_stopping:
+  patience: 20
+  min_delta: 0.0001
+
+eval:
+  digits: 4
+  save_plots: true
